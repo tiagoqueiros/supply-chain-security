@@ -21,11 +21,12 @@ This toolkit gives you a daily automated check to catch these threats early.
 
 | File | Purpose |
 |------|---------|
-| `daily_security_check.sh` | Main scan script |
-| `security_feed_check.sh` | RSS/API feed checker |
-| `packages.conf` | Compromised package list (read at runtime — edit this, not the script) |
-| `feeds.conf` | Security feed URLs (edit to add/remove sources) |
+| `daily_security_check.sh` | Main scan script — checks local machine for threats |
+| `get_feed_data_json.sh` | Fetches threat intelligence from GitHub API + RSS feeds (JSON output for AI) |
+| `packages.conf` | Compromised package list (auto-updated by Claude, or edit manually) |
+| `feeds.conf` | RSS feed URLs (edit to add/remove sources) |
 | `MEMORY.md` | Local run log — gitignored, auto-created on first run |
+| `SCHEDULED_TASK_PROMPT.md` | Prompt for Claude scheduled task (automated threat updates) |
 
 ## What It Checks
 
@@ -47,22 +48,36 @@ This toolkit gives you a daily automated check to catch these threats early.
 | 9 | Docker image check | Compromised images listed in `packages.conf` |
 | 10 | GitHub Actions pinning + suspicious `run:` steps | Tag-pinned actions and `curl \| bash` patterns in workflow files |
 | 11 | VS Code / Cursor extensions | Flags for review after GlassWorm campaign |
-| 12 | Supply chain feed alerts | Live RSS/API check for new attacks (calls `security_feed_check.sh`) |
 
 **Package manager notes:**
 - Section 1b finds malicious packages in `node_modules/` regardless of package manager — this covers npm, pnpm (flat + virtual store), and yarn classic. Peer and transitive dependencies are included since they all end up in `node_modules/`.
 - Section 7 auto-selects the auditor: projects with `pnpm-lock.yaml` → `pnpm audit`, `yarn.lock` → `yarn audit`, `bun.lockb` → `bun pm audit`, otherwise → `npm audit`.
 - **Yarn PnP (Plug'n'Play)**: if using `nodeLinker: pnp`, packages live in `.yarn/cache/*.zip` not `node_modules/` — section 1b cannot scan them. See Known Gaps.
 
-### `security_feed_check.sh`
+### `get_feed_data_json.sh`
 
 Pulls recent supply chain alerts from sources defined in `feeds.conf`:
 - [Socket.dev](https://socket.dev/blog) — malicious package detection across npm, PyPI, Go
-- [Snyk Blog](https://snyk.io/blog/) — AppSec and dependency vulnerabilities
-- [GitHub Security Lab](https://github.blog/tag/github-security-lab/) — vulnerability research
+- [Phylum Blog](https://blog.phylum.io/) — supply chain security research
+- [Sonatype Blog](https://blog.sonatype.com/) — open source security intelligence
 - [GitHub Advisory Database API](https://github.com/advisories) — real-time malware advisories
 
-Highlights supply-chain-specific keywords (malware, typosquat, backdoor, exfiltration, etc.) in red.
+Outputs JSON format for AI consumption (Claude scheduled task).
+
+### AI-Powered Threat Updates (Recommended)
+
+Instead of manually updating `packages.conf`, use Claude via a scheduled task:
+
+1. **Set up a scheduled task** (daily or weekly) using `SCHEDULED_TASK_PROMPT.md`
+2. **Claude automatically:**
+   - Fetches fresh threat data via `get_feed_data_json.sh`
+   - Parses GitHub Advisory API (structured package data)
+   - Reads RSS feeds (unstructured threat intelligence)
+   - Updates `packages.conf` with new threats
+   - Runs the full scan
+   - Updates `MEMORY.md` with findings
+
+This gives you **zero-maintenance threat intelligence** — Claude handles the parsing, decision-making, and updates.
 
 ## Quick Start
 
@@ -77,11 +92,8 @@ bash daily_security_check.sh
 # Scan a specific directory
 bash daily_security_check.sh /path/to/your/code
 
-# Just check security feeds (last 3 days)
-bash security_feed_check.sh
-
-# Feed alerts for last 7 days
-bash security_feed_check.sh 7
+# Get feed data as JSON (for AI/automation)
+bash get_feed_data_json.sh 3
 ```
 
 ## Requirements
@@ -129,52 +141,15 @@ Task ID: daily-security-check
 Schedule: 0 9 * * * (every day at 9am)
 ```
 
-Use this prompt for the task:
+**Use the prompt from `SCHEDULED_TASK_PROMPT.md`** — it contains complete instructions for:
+1. Fetching threat intelligence via `get_feed_data_json.sh`
+2. Reading full article content from RSS feeds
+3. Extracting package names and ecosystems from unstructured text
+4. Updating `packages.conf` with new threats
+5. Running the full scan
+6. Updating `MEMORY.md` with findings
 
-```
-You are a supply chain security scanner. Your job is to check for new
-threats and scan the local machine.
-
-## Context
-- Scripts: ~/path/to/supply-chain-security/
-- Package list: ~/path/to/supply-chain-security/packages.conf (source of truth for compromised packages)
-- Feed list: ~/path/to/supply-chain-security/feeds.conf
-- Memory: ~/path/to/supply-chain-security/MEMORY.md (read FIRST)
-- Scan: ~/path/to/supply-chain-security/daily_security_check.sh
-- Feeds: ~/path/to/supply-chain-security/security_feed_check.sh
-
-## Steps
-
-### 1. Read MEMORY.md
-Read the memory file to understand what packages are already tracked
-and what was found in previous runs.
-
-### 2. Check Feeds for New Threats
-Run: bash ~/path/to/supply-chain-security/security_feed_check.sh 3
-Also query GitHub Advisory API for recent malware:
-curl -s "https://api.github.com/advisories?type=malware&per_page=20&sort=published&direction=desc"
-
-### 3. Update Compromised Package List
-If feeds or advisories reveal NEW compromised packages (not already in MEMORY.md):
-- Add them to packages.conf (ecosystem|package|bad_versions|notes)
-- Add them to the "Compromised Packages" table in MEMORY.md for human reference
-- Add ALL packages found — do not filter by download count; we may be using any of them
-- The script reads packages.conf at runtime — no script edits needed
-
-### 4. Run Full Scan
-Run: bash ~/path/to/supply-chain-security/daily_security_check.sh
-
-### 5. Update MEMORY.md Run History
-Append a new entry with date, warnings found, new packages added,
-notable alerts, and action items.
-
-### 6. Report
-Concise summary. Flag critical warnings prominently.
-```
-
-Replace `~/path/to/supply-chain-security/` with wherever you cloned the repo.
-
-The key advantage of using Claude Code as the scheduler is that it **reasons about new advisories** — it reads the advisory, understands whether it's relevant to your stack, and decides whether to add it to the blocklist.
+The key advantage of using Claude as the scheduler is that it **reads and researches** RSS feed articles to extract package names, then automatically updates your threat database. Zero manual maintenance required.
 
 ## Known Gaps
 

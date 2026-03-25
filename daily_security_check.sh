@@ -1,26 +1,35 @@
 #!/bin/bash
 export PATH="$HOME/.local/bin:$PATH"
-# =============================================================
-# daily_security_check.sh
-# Supply Chain & Credential Security — Daily Check Script
-# Updated: 2026-03-25
-#
-# Now auto-discovers all Node.js and Python projects under
-# SCAN_ROOT and runs npm audit / pip-audit in each.
-#
-# Usage:  bash daily_security_check.sh [scan_root]
-#         Default scan_root: ~
-# =============================================================
 
 SCAN_ROOT="${1:-$HOME}"
-SCAN_DEPTH=10          # how deep to look for projects
-MAX_AUDIT_TIME=60      # seconds per audit before timeout
+SCAN_DEPTH=6
+MAX_AUDIT_TIME=60
+if command -v nproc &>/dev/null; then
+    CPU_COUNT=$(nproc)
+elif command -v sysctl &>/dev/null; then
+    CPU_COUNT=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+else
+    CPU_COUNT=4
+fi
+MAX_PARALLEL_JOBS=${MAX_PARALLEL_JOBS:-$((CPU_COUNT > 8 ? 8 : CPU_COUNT))}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCK_FILE="$SCRIPT_DIR/.daily_check.lock"
+TEMP_DIR=$(mktemp -d)
 
-# Detect interactive vs non-interactive (scheduled task, CI, pipe)
+if [ -f "$LOCK_FILE" ]; then
+    LOCK_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "Another instance (PID $LOCK_PID) is already running. Exiting."
+        exit 1
+    else
+        rm -f "$LOCK_FILE"
+    fi
+fi
+echo $$ > "$LOCK_FILE"
+trap "rm -f '$LOCK_FILE' '$DISCOVERED_PROJECTS_CACHE' 2>/dev/null; rm -rf '$TEMP_DIR' 2>/dev/null" EXIT INT TERM
+
 [ -t 0 ] && INTERACTIVE=true || INTERACTIVE=false
 
-# Auto-create MEMORY.md from template if it doesn't exist
 MEMORY_FILE="$SCRIPT_DIR/MEMORY.md"
 MEMORY_TEMPLATE="$SCRIPT_DIR/MEMORY.template.md"
 PACKAGES_CONF="$SCRIPT_DIR/packages.conf"
@@ -41,17 +50,14 @@ if [ ! -f "$MEMORY_FILE" ] && [ -f "$MEMORY_TEMPLATE" ]; then
     echo "Created MEMORY.md from template"
 fi
 
-# ─────────────────────────────────────────────
-# Setup check — verify required tools are installed
-# ─────────────────────────────────────────────
 SETUP_OK=true
 if ! command -v pip-audit &>/dev/null; then
     SETUP_OK=false
     if $INTERACTIVE; then
         echo ""
-        echo "╔══════════════════════════════════════════════════════════╗"
-        echo "║  SETUP: Missing recommended tools                        ║"
-        echo "╚══════════════════════════════════════════════════════════╝"
+        echo "══════════════════════════════════════════════════════════"
+        echo "  SETUP: Missing recommended tools                        "
+        echo "══════════════════════════════════════════════════════════"
         echo "  pip-audit not found — Python vulnerability scanning disabled."
         echo "  To install: pipx install pip-audit"
         echo ""
@@ -65,7 +71,6 @@ if ! command -v pip-audit &>/dev/null; then
             fi
         fi
     fi
-    # Non-interactive: silently noted in section 8 output
 fi
 
 RED='\033[0;31m'
@@ -85,15 +90,25 @@ header() { echo -e "\n${BLUE}━━━ $1 ━━━${NC}"; }
 sub()    { echo -e "  ${CYAN}→${NC} $1"; }
 
 echo ""
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║      Daily Supply Chain Security Check                   ║"
-echo "║      $(date '+%Y-%m-%d %H:%M')                                   ║"
-echo "║      Scan root: ${SCAN_ROOT}                             ║"
-echo "╚══════════════════════════════════════════════════════════╝"
+echo "══════════════════════════════════════════════════════════"
+echo "  Daily Supply Chain Security Check"
+echo "  $(date '+%Y-%m-%d %H:%M')"
+echo "  Scan root: ${SCAN_ROOT}"
+echo "══════════════════════════════════════════════════════════"
 
-# ─────────────────────────────────────────────
+info "Discovering projects (depth $SCAN_DEPTH, parallel jobs: $MAX_PARALLEL_JOBS)..."
+DISCOVERED_PROJECTS_CACHE=$(mktemp)
+
+find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" \
+    -not -path "*/node_modules/*" \
+    -not -path "*/.npm/*" \
+    -not -path "*/.pnpm/*" \
+    -not -path "*/.pnpm-store/*" \
+    -not -path "*/.cache/*" \
+    \( -name "package.json" -o -name "requirements.txt" -o -name "pyproject.toml" -o -name "Pipfile" -o -name "setup.py" \) \
+    -print 2>/dev/null > "$DISCOVERED_PROJECTS_CACHE"
+
 header "1. Known Compromised Packages (packages.conf)"
-# ─────────────────────────────────────────────
 if [ ! -f "$PACKAGES_CONF" ]; then
     warn "packages.conf not found at $PACKAGES_CONF — skipping compromised package checks"
 else
@@ -135,7 +150,6 @@ except Exception as e:
     print(f"  ERROR reading packages.conf: {e}")
     sys.exit(1)
 
-# ── pip (global) ──
 print("\n  \033[0;34m— pip (global) —\033[0m")
 for pkg, bad_versions, all_bad, notes in pip_packages:
     try:
@@ -151,7 +165,6 @@ for pkg, bad_versions, all_bad, notes in pip_packages:
     except meta.PackageNotFoundError:
         print(f"  \033[0;32m✓\033[0m {pkg} not installed")
 
-# ── npm (global) ──
 print("\n  \033[0;34m— npm (global) —\033[0m")
 try:
     result = subprocess.run(["npm", "list", "-g", "--depth=0"], capture_output=True, text=True, timeout=15)
@@ -176,31 +189,33 @@ for pkg, bad_versions, all_bad, notes in npm_packages:
 PKGCHECK
 fi
 
-# ─────────────────────────────────────────────
 header "1b. Malicious npm Packages — Project node_modules"
-# ─────────────────────────────────────────────
 if [ ! -f "$PACKAGES_CONF" ]; then
     info "packages.conf not found — skipping project node_modules check"
 else
     PROJ_HIT=false
+    NPM_MALICIOUS=()
     while IFS='|' read -r ecosystem pkg bad_versions notes; do
         [[ -z "$ecosystem" || "$ecosystem" == \#* || "$ecosystem" != "npm" ]] && continue
         pkg="${pkg// /}"
-        MATCHES=$(find "$SCAN_ROOT" -maxdepth $((SCAN_DEPTH+1)) -type d \
-            -path "*/node_modules/$pkg" 2>/dev/null)
-        if [ -n "$MATCHES" ]; then
-            while IFS= read -r match; do
-                warn "Malicious npm package in project: $pkg → ${match#$SCAN_ROOT/}"
-                PROJ_HIT=true
-            done <<< "$MATCHES"
-        fi
+        NPM_MALICIOUS+=("$pkg")
     done < "$PACKAGES_CONF"
+
+    if [ ${#NPM_MALICIOUS[@]} -gt 0 ]; then
+        while IFS= read -r -d '' nm_dir; do
+            for pkg in "${NPM_MALICIOUS[@]}"; do
+                if [ -d "$nm_dir/$pkg" ]; then
+                    warn "Malicious npm package in project: $pkg → ${nm_dir#$SCAN_ROOT/}/$pkg"
+                    PROJ_HIT=true
+                fi
+            done
+        done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -type d -name "node_modules" \
+            -not -path "*/node_modules/*/node_modules" -print0 2>/dev/null)
+    fi
     $PROJ_HIT || pass "No malicious npm packages found in project node_modules"
 fi
 
-# ─────────────────────────────────────────────
 header "2. Python — Suspicious .pth Auto-Exec Files"
-# ─────────────────────────────────────────────
 LEGIT_PTH=("uno.pth" "coloredlogs.pth" "easy-install.pth" "distutils-precedence.pth" "README.pth" "setuptools.pth" "_virtualenv.pth")
 SITE_PKG=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null)
 if [ -n "$SITE_PKG" ]; then
@@ -225,25 +240,40 @@ else
     info "Could not determine site-packages directory"
 fi
 
-# ─────────────────────────────────────────────
 header "3. Exposed .env Files"
-# ─────────────────────────────────────────────
 ENV_COUNT=0
-while IFS= read -r -d '' f; do
-    # Skip .env.example / .env.template / .env.sample
-    case "$f" in *.example|*.template|*.sample) continue ;; esac
-    warn "Exposed .env file: $f"
-    ENV_COUNT=$((ENV_COUNT+1))
-done < <(find "$HOME" /tmp /var/tmp -maxdepth 6 \( -name ".env" -o -name "*.env" \) \
-    -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/venv/*" \
-    -not -path "*/.venv/*" -not -name "*.example" -not -name "*.template" \
-    -not -name "*.sample" -print0 2>/dev/null)
+PROJECT_DIRS=()
+while IFS= read -r project_file; do
+    proj_dir=$(dirname "$project_file")
+    PROJECT_DIRS+=("$proj_dir")
+done < "$DISCOVERED_PROJECTS_CACHE"
+
+UNIQUE_DIRS=()
+for d in "${PROJECT_DIRS[@]}"; do
+    already_seen=false
+    for seen in "${UNIQUE_DIRS[@]}"; do
+        [ "$seen" = "$d" ] && already_seen=true && break
+    done
+    $already_seen || UNIQUE_DIRS+=("$d")
+done
+
+UNIQUE_DIRS+=("/tmp" "/var/tmp")
+
+for search_dir in "${UNIQUE_DIRS[@]}"; do
+    [ ! -d "$search_dir" ] && continue
+    while IFS= read -r -d '' f; do
+        case "$f" in *.example|*.template|*.sample) continue ;; esac
+        warn "Exposed .env file: $f"
+        ENV_COUNT=$((ENV_COUNT+1))
+    done < <(find "$search_dir" -maxdepth 2 \( -name ".env" -o -name "*.env" \) \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/venv/*" \
+        -not -path "*/.venv/*" -not -name "*.example" -not -name "*.template" \
+        -not -name "*.sample" -print0 2>/dev/null)
+done
 [ "$ENV_COUNT" -eq 0 ] && pass "No exposed .env files found"
 
-# ─────────────────────────────────────────────
 header "3b. Registry Credential Files (.npmrc / .pypirc)"
-# ─────────────────────────────────────────────
-# Global ~/.npmrc
+
 if [ -f "$HOME/.npmrc" ]; then
     if grep -qE "_authToken|password" "$HOME/.npmrc" 2>/dev/null; then
         info "~/.npmrc contains registry auth tokens — ensure it's not committed to git"
@@ -252,7 +282,7 @@ if [ -f "$HOME/.npmrc" ]; then
         pass "~/.npmrc — no auth tokens"
     fi
 fi
-# Project .npmrc files with credentials
+
 NPMRC_HIT=false
 while IFS= read -r -d '' f; do
     if grep -qE "_authToken|password" "$f" 2>/dev/null; then
@@ -263,7 +293,6 @@ done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name ".npmrc" \
     -not -path "$HOME/.npmrc" -not -path "*/node_modules/*" -print0 2>/dev/null)
 $NPMRC_HIT || pass "No project .npmrc files with exposed credentials"
 
-# ~/.pypirc
 if [ -f "$HOME/.pypirc" ]; then
     if grep -qE "password|token" "$HOME/.pypirc" 2>/dev/null; then
         info "~/.pypirc contains credentials — ensure it's not committed to git"
@@ -272,7 +301,6 @@ if [ -f "$HOME/.pypirc" ]; then
     fi
 fi
 
-# .npmrc registry spoofing — non-official registry URLs can enable dependency confusion
 REGISTRY_HIT=false
 for npmrc in "$HOME/.npmrc" $(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name ".npmrc" \
     -not -path "$HOME/.npmrc" -not -path "*/node_modules/*" 2>/dev/null); do
@@ -285,9 +313,7 @@ for npmrc in "$HOME/.npmrc" $(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name ".
 done
 $REGISTRY_HIT || pass "All .npmrc files point to official registry (or none set)"
 
-# ─────────────────────────────────────────────
 header "4. Shell Startup File Integrity"
-# ─────────────────────────────────────────────
 SHELL_FILES=("$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.profile" "$HOME/.bash_aliases")
 SUSPICIOUS_PATTERNS='(curl|wget)\s+(http|-).*\|.*sh|python.*-c.*http|base64.*decode.*exec|nc\s+-e|ncat\s+-e|mkfifo.*>/dev/tcp'
 for f in "${SHELL_FILES[@]}"; do
@@ -301,9 +327,7 @@ for f in "${SHELL_FILES[@]}"; do
     fi
 done
 
-# ─────────────────────────────────────────────
 header "5. Crontab Check"
-# ─────────────────────────────────────────────
 CRON_CONTENT=$(crontab -l 2>/dev/null)
 if [ -z "$CRON_CONTENT" ]; then
     pass "No user crontab entries"
@@ -317,9 +341,7 @@ else
     fi
 fi
 
-# ─────────────────────────────────────────────
 header "6. SSH Key Check"
-# ─────────────────────────────────────────────
 if [ -d "$HOME/.ssh" ]; then
     KEY_COUNT=$(find "$HOME/.ssh" -name "*.pub" 2>/dev/null | wc -l | tr -d ' ')
     AUTH_KEYS="$HOME/.ssh/authorized_keys"
@@ -332,9 +354,7 @@ else
     pass "No .ssh directory found"
 fi
 
-# ─────────────────────────────────────────────
 header "6b. macOS Launch Agents / Daemons"
-# ─────────────────────────────────────────────
 if [ "$(uname)" = "Darwin" ]; then
     LAUNCH_DIRS=(
         "$HOME/Library/LaunchAgents"
@@ -361,92 +381,115 @@ else
     info "Not macOS — skipping Launch Agent check"
 fi
 
-# ─────────────────────────────────────────────
 header "7. Node.js Projects — Recursive audit (npm / pnpm / yarn / bun)"
-# ─────────────────────────────────────────────
 if command -v npm &>/dev/null || command -v pnpm &>/dev/null; then
     NPM_PROJECTS=()
-    while IFS= read -r -d '' pj; do
-        NPM_PROJECTS+=("$(dirname "$pj")")
-    done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name "package.json" \
-        -not -path "*/node_modules/*" -not -path "*/.git/*" \
-        -not -path "*/dist/*" -not -path "*/build/*" -print0 2>/dev/null)
+    while IFS= read -r pj; do
+        if [[ "$pj" == *"/package.json" ]]; then
+            proj_dir="$(dirname "$pj")"
+            [ -d "$proj_dir/node_modules" ] && NPM_PROJECTS+=("$proj_dir")
+        fi
+    done < "$DISCOVERED_PROJECTS_CACHE"
 
     if [ ${#NPM_PROJECTS[@]} -eq 0 ]; then
         info "No Node.js projects found under $SCAN_ROOT"
     else
-        info "Found ${#NPM_PROJECTS[@]} Node.js project(s)"
+        info "Found ${#NPM_PROJECTS[@]} Node.js project(s) — auditing in parallel..."
+
+        JOB_COUNT=0
         for proj in "${NPM_PROJECTS[@]}"; do
-            proj_name="${proj#$SCAN_ROOT/}"
-            if [ ! -d "$proj/node_modules" ]; then
-                info "$proj_name — no node_modules (skipped, not installed)"
-                continue
-            fi
+            while [ $(jobs -r | wc -l) -ge $MAX_PARALLEL_JOBS ]; do
+                sleep 0.1
+            done
 
-            # Pick the right auditor based on lockfile
-            if [ -f "$proj/pnpm-lock.yaml" ] && command -v pnpm &>/dev/null; then
-                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pnpm audit --json 2>/dev/null)
-                AUDITOR="pnpm"
-            elif [ -f "$proj/yarn.lock" ] && command -v yarn &>/dev/null; then
-                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" yarn audit --json 2>/dev/null)
-                AUDITOR="yarn"
-            elif [ -f "$proj/bun.lockb" ] && command -v bun &>/dev/null; then
-                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" bun pm audit --json 2>/dev/null)
-                AUDITOR="bun"
-            else
-                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" npm audit --json 2>/dev/null)
-                AUDITOR="npm"
-            fi
+            (
+                proj_name="${proj#$SCAN_ROOT/}"
+                RESULT_FILE="$TEMP_DIR/npm_$(echo "$proj_name" | tr '/' '_').result"
 
-            if [ $? -eq 124 ]; then
-                info "$proj_name — $AUDITOR audit timed out"
-                continue
-            fi
-            VULN_COUNT=$(echo "$AUDIT" | python3 -c "
+                LOCK_FILES=("$proj/.package-lock.json.lock" "$proj/.pnpm-lock.yaml.lock" "$proj/.yarn-lock.lock")
+                for lf in "${LOCK_FILES[@]}"; do
+                    if [ -f "$lf" ]; then
+                        exit 0
+                    fi
+                done
+
+                if [ -f "$proj/pnpm-lock.yaml" ] && command -v pnpm &>/dev/null; then
+                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pnpm audit --offline --json 2>/dev/null)
+                    AUDITOR="pnpm"
+                elif [ -f "$proj/yarn.lock" ] && command -v yarn &>/dev/null; then
+                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" yarn audit --offline --json 2>/dev/null)
+                    AUDITOR="yarn"
+                elif [ -f "$proj/bun.lockb" ] && command -v bun &>/dev/null; then
+                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" bun pm audit --json 2>/dev/null)
+                    AUDITOR="bun"
+                else
+                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" npm audit --offline --no-update-notifier --json 2>/dev/null)
+                    AUDITOR="npm"
+                fi
+
+                if [ $? -eq 124 ]; then
+                    echo "INFO|$proj_name|$AUDITOR audit timed out" > "$RESULT_FILE"
+                    exit 0
+                fi
+
+                VULN_COUNT=$(echo "$AUDIT" | python3 -c "
 import json,sys
 try:
     d=json.load(sys.stdin)
     v=d.get('metadata',{}).get('vulnerabilities',{})
     print(v.get('high',0) + v.get('critical',0))
 except: print('?')" 2>/dev/null)
-            TOTAL=$(echo "$AUDIT" | python3 -c "
+                TOTAL=$(echo "$AUDIT" | python3 -c "
 import json,sys
 try:
     d=json.load(sys.stdin)
     print(d.get('metadata',{}).get('vulnerabilities',{}).get('total',0))
 except: print('?')" 2>/dev/null)
-            if [ "$TOTAL" = "0" ]; then
-                pass "$proj_name [$AUDITOR] — 0 vulnerabilities"
-            elif [ "$VULN_COUNT" != "0" ] && [ "$VULN_COUNT" != "?" ]; then
-                warn "$proj_name [$AUDITOR] — $VULN_COUNT high/critical vulns ($TOTAL total)"
-            elif [ "$TOTAL" != "?" ]; then
-                info "$proj_name [$AUDITOR] — $TOTAL vulnerabilities (none high/critical)"
-            else
-                info "$proj_name [$AUDITOR] — audit parse error, run manually"
+
+                if [ "$TOTAL" = "0" ]; then
+                    echo "PASS|$proj_name|[$AUDITOR] — 0 vulnerabilities" > "$RESULT_FILE"
+                elif [ "$VULN_COUNT" != "0" ] && [ "$VULN_COUNT" != "?" ]; then
+                    echo "WARN|$proj_name|[$AUDITOR] — $VULN_COUNT high/critical vulns ($TOTAL total)" > "$RESULT_FILE"
+                elif [ "$TOTAL" != "?" ]; then
+                    echo "INFO|$proj_name|[$AUDITOR] — $TOTAL vulnerabilities (none high/critical)" > "$RESULT_FILE"
+                else
+                    echo "INFO|$proj_name|[$AUDITOR] — audit parse error, run manually" > "$RESULT_FILE"
+                fi
+            ) &
+            JOB_COUNT=$((JOB_COUNT+1))
+        done
+
+        wait
+
+        for proj in "${NPM_PROJECTS[@]}"; do
+            proj_name="${proj#$SCAN_ROOT/}"
+            RESULT_FILE="$TEMP_DIR/npm_$(echo "$proj_name" | tr '/' '_').result"
+            if [ -f "$RESULT_FILE" ]; then
+                IFS='|' read -r level name message < "$RESULT_FILE"
+                case "$level" in
+                    PASS) pass "$name $message" ;;
+                    WARN) warn "$name $message" ;;
+                    INFO) info "$name $message" ;;
+                esac
             fi
         done
     fi
 
-    # Global npm packages
     GLOBAL_PKGS=$(npm list -g --depth=0 2>/dev/null | grep -c "@" || echo 0)
     info "$GLOBAL_PKGS global npm packages — run 'npm list -g --depth=0' to review"
 else
     info "npm/pnpm not found — skipping Node.js checks"
 fi
 
-# ─────────────────────────────────────────────
 header "8. Python Projects — Recursive pip-audit"
-# ─────────────────────────────────────────────
 PY_PROJECTS=()
-while IFS= read -r -d '' pf; do
-    PY_PROJECTS+=("$(dirname "$pf")")
-done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" \
-    \( -name "requirements.txt" -o -name "pyproject.toml" -o -name "Pipfile" -o -name "setup.py" \) \
-    -not -path "*/node_modules/*" -not -path "*/.git/*" \
-    -not -path "*/venv/*" -not -path "*/.venv/*" -print0 2>/dev/null)
+while IFS= read -r pf; do
+    if [[ "$pf" == *"/requirements.txt" ]] || [[ "$pf" == *"/pyproject.toml" ]] || \
+       [[ "$pf" == *"/Pipfile" ]] || [[ "$pf" == *"/setup.py" ]]; then
+        PY_PROJECTS+=("$(dirname "$pf")")
+    fi
+done < "$DISCOVERED_PROJECTS_CACHE"
 
-# Deduplicate (a project may have both requirements.txt and pyproject.toml)
-# Uses bash 3.2-compatible approach (no associative arrays)
 PY_UNIQUE=()
 for p in "${PY_PROJECTS[@]}"; do
     already_seen=false
@@ -459,32 +502,56 @@ done
 if [ ${#PY_UNIQUE[@]} -eq 0 ]; then
     info "No Python projects found under $SCAN_ROOT"
 else
-    info "Found ${#PY_UNIQUE[@]} Python project(s)"
+    info "Found ${#PY_UNIQUE[@]} Python project(s) — auditing in parallel..."
     if command -v pip-audit &>/dev/null; then
         for proj in "${PY_UNIQUE[@]}"; do
-            proj_name="${proj#$SCAN_ROOT/}"
-            # Try venv first, then global
-            VENV_PYTHON=""
-            for vp in "$proj/.venv/bin/python" "$proj/venv/bin/python"; do
-                [ -x "$vp" ] && VENV_PYTHON="$vp" && break
+            while [ $(jobs -r | wc -l) -ge $MAX_PARALLEL_JOBS ]; do
+                sleep 0.1
             done
 
-            if [ -n "$VENV_PYTHON" ]; then
-                AUDIT_OUT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pip-audit --python "$VENV_PYTHON" 2>&1)
-            elif [ -f "$proj/requirements.txt" ]; then
-                AUDIT_OUT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pip-audit -r requirements.txt 2>&1)
-            else
-                AUDIT_OUT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pip-audit 2>&1)
-            fi
+            (
+                proj_name="${proj#$SCAN_ROOT/}"
+                RESULT_FILE="$TEMP_DIR/pip_$(echo "$proj_name" | tr '/' '_').result"
 
-            VULN_LINES=$(echo "$AUDIT_OUT" | grep -c "^Name" 2>/dev/null || echo 0)
-            FOUND=$(echo "$AUDIT_OUT" | grep -oE "Found [0-9]+ known vulnerabilit" | grep -oE "[0-9]+" || echo "0")
+                VENV_PYTHON=""
+                for vp in "$proj/.venv/bin/python" "$proj/venv/bin/python"; do
+                    [ -x "$vp" ] && VENV_PYTHON="$vp" && break
+                done
 
-            if [ "$FOUND" = "0" ]; then
-                pass "$proj_name — no known vulnerabilities"
-            else
-                warn "$proj_name — $FOUND known vulnerability(ies)"
-                echo "$AUDIT_OUT" | grep -E "^[A-Za-z]" | grep -v "^Name" | sed 's/^/    /'
+                if [ -n "$VENV_PYTHON" ]; then
+                    AUDIT_OUT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pip-audit --python "$VENV_PYTHON" 2>&1)
+                elif [ -f "$proj/requirements.txt" ]; then
+                    AUDIT_OUT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pip-audit -r requirements.txt 2>&1)
+                else
+                    AUDIT_OUT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pip-audit 2>&1)
+                fi
+
+                FOUND=$(echo "$AUDIT_OUT" | grep -oE "Found [0-9]+ known vulnerabilit" | grep -oE "[0-9]+" || echo "0")
+
+                if [ "$FOUND" = "0" ]; then
+                    echo "PASS|$proj_name|no known vulnerabilities" > "$RESULT_FILE"
+                else
+                    echo "WARN|$proj_name|$FOUND known vulnerability(ies)" > "$RESULT_FILE"
+                    echo "$AUDIT_OUT" | grep -E "^[A-Za-z]" | grep -v "^Name" | sed 's/^/    /' >> "$RESULT_FILE"
+                fi
+            ) &
+        done
+
+        wait
+
+        for proj in "${PY_UNIQUE[@]}"; do
+            proj_name="${proj#$SCAN_ROOT/}"
+            RESULT_FILE="$TEMP_DIR/pip_$(echo "$proj_name" | tr '/' '_').result"
+            if [ -f "$RESULT_FILE" ]; then
+                IFS='|' read -r level name message < "$RESULT_FILE"
+                case "$level" in
+                    PASS) pass "$name — $message" ;;
+                    WARN)
+                        warn "$name — $message"
+                        tail -n +2 "$RESULT_FILE"
+                        ;;
+                    INFO) info "$name — $message" ;;
+                esac
             fi
         done
     else
@@ -492,7 +559,6 @@ else
     fi
 fi
 
-# Also run pip-audit globally
 header "8b. Python Global Environment"
 if command -v pip-audit &>/dev/null; then
     GLOBAL_AUDIT=$(timeout "$MAX_AUDIT_TIME" pip-audit 2>&1)
@@ -507,9 +573,7 @@ else
     info "pip-audit not installed globally"
 fi
 
-# ─────────────────────────────────────────────
 header "9. Docker — Suspicious Images"
-# ─────────────────────────────────────────────
 if command -v docker &>/dev/null; then
     IMAGES=$(docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null)
     DOCKER_HIT=false
@@ -534,9 +598,7 @@ else
     pass "Docker not installed — skip"
 fi
 
-# ─────────────────────────────────────────────
 header "10. GitHub Actions — Pinning Check (Recursive)"
-# ─────────────────────────────────────────────
 UNPINNED=0
 GHA_SUSPICIOUS=0
 while IFS= read -r -d '' wf; do
@@ -557,9 +619,7 @@ done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -path "*/.github/workflows/*.
 [ "$UNPINNED" -eq 0 ] && pass "All GitHub Actions pinned (or none found)"
 [ "$GHA_SUSPICIOUS" -eq 0 ] && pass "No suspicious run: patterns in GitHub Actions"
 
-# ─────────────────────────────────────────────
 header "11. VS Code / Cursor Extensions Check"
-# ─────────────────────────────────────────────
 EXT_COUNT=0
 for ext_dir in "$HOME/.vscode/extensions" "$HOME/.cursor/extensions"; do
     if [ -d "$ext_dir" ]; then
@@ -574,19 +634,6 @@ else
     pass "No VS Code/Cursor extensions found"
 fi
 
-# ─────────────────────────────────────────────
-header "12. Supply Chain Feed Alerts (Last 3 Days)"
-# ─────────────────────────────────────────────
-FEED_SCRIPT="$(dirname "$0")/security_feed_check.sh"
-if [ -x "$FEED_SCRIPT" ]; then
-    bash "$FEED_SCRIPT" 3
-else
-    info "Feed checker not found at $FEED_SCRIPT — run it separately"
-fi
-
-# ─────────────────────────────────────────────
-# SUMMARY
-# ─────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════"
 if [ "$WARNINGS" -eq 0 ]; then
