@@ -24,6 +24,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MEMORY_FILE="$SCRIPT_DIR/MEMORY.md"
 MEMORY_TEMPLATE="$SCRIPT_DIR/MEMORY.template.md"
 PACKAGES_CONF="$SCRIPT_DIR/packages.conf"
+if [ ! -f "$PACKAGES_CONF" ]; then
+    if [ -f "$SCRIPT_DIR/packages.conf.example" ]; then
+        cp "$SCRIPT_DIR/packages.conf.example" "$PACKAGES_CONF"
+        echo "Created packages.conf from packages.conf.example"
+    else
+        echo "# Supply Chain Security — Known Compromised Packages" > "$PACKAGES_CONF"
+        echo "# Format: ecosystem|package|bad_versions|notes" >> "$PACKAGES_CONF"
+        echo "# bad_versions: comma-separated versions, \"all\" (any version = malicious), or \"monitor\"" >> "$PACKAGES_CONF"
+        echo "# Supported ecosystems: pip, npm, docker" >> "$PACKAGES_CONF"
+        echo "Created empty packages.conf — add entries as needed"
+    fi
+fi
 if [ ! -f "$MEMORY_FILE" ] && [ -f "$MEMORY_TEMPLATE" ]; then
     cp "$MEMORY_TEMPLATE" "$MEMORY_FILE"
     echo "Created MEMORY.md from template"
