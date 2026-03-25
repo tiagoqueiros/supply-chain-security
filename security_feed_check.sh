@@ -7,6 +7,8 @@
 # =============================================================
 
 DAYS_BACK="${1:-3}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FEEDS_CONF="$SCRIPT_DIR/feeds.conf"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -21,37 +23,36 @@ echo "║      $(date '+%Y-%m-%d %H:%M')  —  Last ${DAYS_BACK} day(s)         
 echo "╚══════════════════════════════════════════════════════════╝"
 
 # ─────────────────────────────────────────────
-# Feed URLs
+# Feed URLs — loaded from feeds.conf
 # ─────────────────────────────────────────────
-FEEDS=(
-    "Socket.dev|https://socket.dev/api/blog/feed.atom|atom"
-    "Snyk Blog|https://snyk.io/blog/feed/|rss"
-    "GitHub Security Lab|https://github.blog/tag/github-security-lab/feed/|rss"
-    "Checkmarx|https://checkmarx.com/blog/feed/|rss"
-)
-
-# GitHub Advisory Database (malware-specific, via API)
-GH_ADVISORY_API="https://api.github.com/advisories?type=malware&per_page=10"
-
 CUTOFF_EPOCH=$(date -v-${DAYS_BACK}d +%s 2>/dev/null || date -d "-${DAYS_BACK} days" +%s 2>/dev/null)
 
 # ─────────────────────────────────────────────
 # Parse feeds with Python (handles both RSS and Atom)
 # ─────────────────────────────────────────────
-python3 - "$DAYS_BACK" "$CUTOFF_EPOCH" <<'PYFEED'
+python3 - "$DAYS_BACK" "$CUTOFF_EPOCH" "$FEEDS_CONF" <<'PYFEED'
 import sys, json, re, urllib.request, ssl
 from xml.etree import ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 days_back = int(sys.argv[1])
 cutoff_epoch = int(sys.argv[2])
+feeds_conf = sys.argv[3]
 cutoff_dt = datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc)
 
-feeds = [
-    ("Socket.dev", "https://socket.dev/api/blog/feed.atom", "atom"),
-    ("Snyk Blog", "https://snyk.io/blog/feed/", "rss"),
-    ("GitHub Security Lab", "https://github.blog/tag/github-security-lab/feed/", "rss"),
-]
+# Load feeds from feeds.conf
+feeds = []
+try:
+    with open(feeds_conf) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) == 3:
+                feeds.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+except Exception as e:
+    print(f"  \033[0;31m⚠️  Could not load feeds.conf: {e}\033[0m")
 
 # Supply chain keywords to highlight
 KEYWORDS = re.compile(

@@ -17,9 +17,13 @@ SCAN_DEPTH=10          # how deep to look for projects
 MAX_AUDIT_TIME=60      # seconds per audit before timeout
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Detect interactive vs non-interactive (scheduled task, CI, pipe)
+[ -t 0 ] && INTERACTIVE=true || INTERACTIVE=false
+
 # Auto-create MEMORY.md from template if it doesn't exist
 MEMORY_FILE="$SCRIPT_DIR/MEMORY.md"
 MEMORY_TEMPLATE="$SCRIPT_DIR/MEMORY.template.md"
+PACKAGES_CONF="$SCRIPT_DIR/packages.conf"
 if [ ! -f "$MEMORY_FILE" ] && [ -f "$MEMORY_TEMPLATE" ]; then
     cp "$MEMORY_TEMPLATE" "$MEMORY_FILE"
     echo "Created MEMORY.md from template"
@@ -31,27 +35,25 @@ fi
 SETUP_OK=true
 if ! command -v pip-audit &>/dev/null; then
     SETUP_OK=false
-    echo ""
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║  SETUP: Missing recommended tools                        ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo "  pip-audit not found — Python vulnerability scanning disabled."
-    echo ""
-    echo "  To install:  pip3 install pip-audit"
-    echo "               # or via pipx (recommended):"
-    echo "               pipx install pip-audit"
-    echo ""
-    printf "  Install pip-audit now? [y/N] "
-    read -r REPLY </dev/tty
-    if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        if command -v pipx &>/dev/null; then
-            pipx install pip-audit && echo "  pip-audit installed via pipx." && SETUP_OK=true
-        else
-            pip3 install pip-audit && echo "  pip-audit installed." && SETUP_OK=true
+    if $INTERACTIVE; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════╗"
+        echo "║  SETUP: Missing recommended tools                        ║"
+        echo "╚══════════════════════════════════════════════════════════╝"
+        echo "  pip-audit not found — Python vulnerability scanning disabled."
+        echo "  To install: pipx install pip-audit"
+        echo ""
+        printf "  Install pip-audit now? [y/N] "
+        read -r REPLY </dev/tty
+        if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
+            if command -v pipx &>/dev/null; then
+                pipx install pip-audit && echo "  pip-audit installed via pipx." && SETUP_OK=true
+            else
+                pip3 install pip-audit && echo "  pip-audit installed." && SETUP_OK=true
+            fi
         fi
-    else
-        echo "  Skipping pip-audit install. Python scan will be limited."
     fi
+    # Non-interactive: silently noted in section 8 output
 fi
 
 RED='\033[0;31m'
@@ -78,28 +80,111 @@ echo "║      Scan root: ${SCAN_ROOT}                             ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
 # ─────────────────────────────────────────────
-header "1. Python — Known Compromised Packages (Global)"
+header "1. Known Compromised Packages (packages.conf)"
 # ─────────────────────────────────────────────
-python3 - <<'PYCHECK'
-import importlib.metadata as meta
-compromised = {
-    "litellm":       ["1.82.7", "1.82.8"],
-    "ultralytics":   ["8.3.41", "8.3.42", "8.3.45", "8.3.46"],
-    "aiohttp":       [],
-    "requests":      [],
-}
-for pkg, bad in compromised.items():
+if [ ! -f "$PACKAGES_CONF" ]; then
+    warn "packages.conf not found at $PACKAGES_CONF — skipping compromised package checks"
+else
+python3 - "$PACKAGES_CONF" <<'PKGCHECK'
+import sys, re, importlib.metadata as meta, subprocess
+
+packages_conf = sys.argv[1]
+pip_packages = []   # (name, bad_versions, all_bad, notes)
+npm_packages = []   # (name, bad_versions, all_bad, notes)
+
+def parse_conf(path):
+    pip, npm = [], []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 3:
+                continue
+            ecosystem, pkg, bad_str = parts[0], parts[1], parts[2]
+            notes = parts[3] if len(parts) > 3 else ""
+            if bad_str.lower() == "all":
+                bad_versions, all_bad = [], True
+            elif bad_str.lower() in ("monitor", "-", ""):
+                bad_versions, all_bad = [], False
+            else:
+                bad_versions = [v.strip() for v in bad_str.split(",") if v.strip()]
+                all_bad = False
+            if ecosystem == "pip":
+                pip.append((pkg, bad_versions, all_bad, notes))
+            elif ecosystem == "npm":
+                npm.append((pkg, bad_versions, all_bad, notes))
+    return pip, npm
+
+try:
+    pip_packages, npm_packages = parse_conf(packages_conf)
+except Exception as e:
+    print(f"  ERROR reading packages.conf: {e}")
+    sys.exit(1)
+
+# ── pip (global) ──
+print("\n  \033[0;34m— pip (global) —\033[0m")
+for pkg, bad_versions, all_bad, notes in pip_packages:
     try:
         v = meta.version(pkg)
-        if bad and v in bad:
-            print(f"WARN: COMPROMISED version of {pkg} == {v} — uninstall immediately!")
-        elif not bad:
-            print(f"INFO: {pkg} {v} installed — monitor for compromise alerts")
+        if all_bad:
+            print(f"  \033[0;31m⚠️  WARNING: MALICIOUS pip package installed: {pkg} {v} — remove immediately! ({notes})\033[0m")
+        elif bad_versions and v in bad_versions:
+            print(f"  \033[0;31m⚠️  WARNING: COMPROMISED version {pkg}=={v} — remove immediately! ({notes})\033[0m")
+        elif bad_versions:
+            print(f"  \033[0;32m✓\033[0m {pkg} {v} (safe; bad versions: {', '.join(bad_versions)})")
         else:
-            print(f"OK: {pkg} {v} (not a known bad version)")
+            print(f"  \033[1;33mℹ\033[0m  {pkg} {v} installed — monitoring ({notes})")
     except meta.PackageNotFoundError:
-        print(f"OK: {pkg} not installed")
-PYCHECK
+        print(f"  \033[0;32m✓\033[0m {pkg} not installed")
+
+# ── npm (global) ──
+print("\n  \033[0;34m— npm (global) —\033[0m")
+try:
+    result = subprocess.run(["npm", "list", "-g", "--depth=0"], capture_output=True, text=True, timeout=15)
+    npm_global = result.stdout
+except Exception:
+    npm_global = ""
+
+for pkg, bad_versions, all_bad, notes in npm_packages:
+    m = re.search(rf"(?:^|\s){re.escape(pkg)}@([\d.\w-]+)", npm_global, re.MULTILINE)
+    if m:
+        v = m.group(1)
+        if all_bad:
+            print(f"  \033[0;31m⚠️  WARNING: MALICIOUS npm package globally: {pkg}@{v} — remove immediately!\033[0m")
+        elif bad_versions and v in bad_versions:
+            print(f"  \033[0;31m⚠️  WARNING: COMPROMISED npm version {pkg}@{v} — remove immediately! ({notes})\033[0m")
+        elif bad_versions:
+            print(f"  \033[1;33mℹ\033[0m  {pkg}@{v} installed globally (safe version; bad: {', '.join(bad_versions)})")
+        else:
+            print(f"  \033[1;33mℹ\033[0m  {pkg}@{v} installed globally — monitoring ({notes})")
+    else:
+        print(f"  \033[0;32m✓\033[0m {pkg} not installed globally")
+PKGCHECK
+fi
+
+# ─────────────────────────────────────────────
+header "1b. Malicious npm Packages — Project node_modules"
+# ─────────────────────────────────────────────
+if [ ! -f "$PACKAGES_CONF" ]; then
+    info "packages.conf not found — skipping project node_modules check"
+else
+    PROJ_HIT=false
+    while IFS='|' read -r ecosystem pkg bad_versions notes; do
+        [[ -z "$ecosystem" || "$ecosystem" == \#* || "$ecosystem" != "npm" ]] && continue
+        pkg="${pkg// /}"
+        MATCHES=$(find "$SCAN_ROOT" -maxdepth $((SCAN_DEPTH+1)) -type d \
+            -path "*/node_modules/$pkg" 2>/dev/null)
+        if [ -n "$MATCHES" ]; then
+            while IFS= read -r match; do
+                warn "Malicious npm package in project: $pkg → ${match#$SCAN_ROOT/}"
+                PROJ_HIT=true
+            done <<< "$MATCHES"
+        fi
+    done < "$PACKAGES_CONF"
+    $PROJ_HIT || pass "No malicious npm packages found in project node_modules"
+fi
 
 # ─────────────────────────────────────────────
 header "2. Python — Suspicious .pth Auto-Exec Files"
@@ -142,6 +227,51 @@ done < <(find "$HOME" /tmp /var/tmp -maxdepth 6 \( -name ".env" -o -name "*.env"
     -not -path "*/.venv/*" -not -name "*.example" -not -name "*.template" \
     -not -name "*.sample" -print0 2>/dev/null)
 [ "$ENV_COUNT" -eq 0 ] && pass "No exposed .env files found"
+
+# ─────────────────────────────────────────────
+header "3b. Registry Credential Files (.npmrc / .pypirc)"
+# ─────────────────────────────────────────────
+# Global ~/.npmrc
+if [ -f "$HOME/.npmrc" ]; then
+    if grep -qE "_authToken|password" "$HOME/.npmrc" 2>/dev/null; then
+        info "~/.npmrc contains registry auth tokens — ensure it's not committed to git"
+        grep -E "_authToken|password" "$HOME/.npmrc" | sed 's/=.*/=[REDACTED]/' | sed 's/^/    /'
+    else
+        pass "~/.npmrc — no auth tokens"
+    fi
+fi
+# Project .npmrc files with credentials
+NPMRC_HIT=false
+while IFS= read -r -d '' f; do
+    if grep -qE "_authToken|password" "$f" 2>/dev/null; then
+        warn "Project .npmrc with credentials: ${f#$SCAN_ROOT/}"
+        NPMRC_HIT=true
+    fi
+done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name ".npmrc" \
+    -not -path "$HOME/.npmrc" -not -path "*/node_modules/*" -print0 2>/dev/null)
+$NPMRC_HIT || pass "No project .npmrc files with exposed credentials"
+
+# ~/.pypirc
+if [ -f "$HOME/.pypirc" ]; then
+    if grep -qE "password|token" "$HOME/.pypirc" 2>/dev/null; then
+        info "~/.pypirc contains credentials — ensure it's not committed to git"
+    else
+        pass "~/.pypirc — no plaintext credentials"
+    fi
+fi
+
+# .npmrc registry spoofing — non-official registry URLs can enable dependency confusion
+REGISTRY_HIT=false
+for npmrc in "$HOME/.npmrc" $(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name ".npmrc" \
+    -not -path "$HOME/.npmrc" -not -path "*/node_modules/*" 2>/dev/null); do
+    [ -f "$npmrc" ] || continue
+    CUSTOM_REG=$(grep -E "^registry\s*=" "$npmrc" 2>/dev/null | grep -v "registry.npmjs.org" || true)
+    if [ -n "$CUSTOM_REG" ]; then
+        info "Non-official npm registry in ${npmrc#$HOME/}: $CUSTOM_REG"
+        REGISTRY_HIT=true
+    fi
+done
+$REGISTRY_HIT || pass "All .npmrc files point to official registry (or none set)"
 
 # ─────────────────────────────────────────────
 header "4. Shell Startup File Integrity"
@@ -191,9 +321,38 @@ else
 fi
 
 # ─────────────────────────────────────────────
-header "7. Node.js Projects — Recursive npm audit"
+header "6b. macOS Launch Agents / Daemons"
 # ─────────────────────────────────────────────
-if command -v npm &>/dev/null; then
+if [ "$(uname)" = "Darwin" ]; then
+    LAUNCH_DIRS=(
+        "$HOME/Library/LaunchAgents"
+        "/Library/LaunchAgents"
+        "/Library/LaunchDaemons"
+    )
+    LAUNCH_SUSPICIOUS='(curl|wget)\s+(http|-).*\|.*sh|python.*-c.*http|base64.*decode|nc\s+-e|/tmp/|ProgramArguments.*curl'
+    LAUNCH_HIT=false
+    for ldir in "${LAUNCH_DIRS[@]}"; do
+        [ -d "$ldir" ] || continue
+        while IFS= read -r -d '' plist; do
+            plist_name="${plist#$HOME/}"
+            if grep -qE "$LAUNCH_SUSPICIOUS" "$plist" 2>/dev/null; then
+                warn "Suspicious Launch Agent/Daemon: $plist_name"
+                grep -E "$LAUNCH_SUSPICIOUS" "$plist" | head -2 | sed 's/^/    /'
+                LAUNCH_HIT=true
+            else
+                info "$plist_name — $(basename "$plist")"
+            fi
+        done < <(find "$ldir" -maxdepth 1 -name "*.plist" -print0 2>/dev/null)
+    done
+    $LAUNCH_HIT || pass "No suspicious Launch Agents/Daemons found"
+else
+    info "Not macOS — skipping Launch Agent check"
+fi
+
+# ─────────────────────────────────────────────
+header "7. Node.js Projects — Recursive audit (npm / pnpm / yarn / bun)"
+# ─────────────────────────────────────────────
+if command -v npm &>/dev/null || command -v pnpm &>/dev/null; then
     NPM_PROJECTS=()
     while IFS= read -r -d '' pj; do
         NPM_PROJECTS+=("$(dirname "$pj")")
@@ -211,9 +370,24 @@ if command -v npm &>/dev/null; then
                 info "$proj_name — no node_modules (skipped, not installed)"
                 continue
             fi
-            AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" npm audit --json 2>/dev/null)
+
+            # Pick the right auditor based on lockfile
+            if [ -f "$proj/pnpm-lock.yaml" ] && command -v pnpm &>/dev/null; then
+                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pnpm audit --json 2>/dev/null)
+                AUDITOR="pnpm"
+            elif [ -f "$proj/yarn.lock" ] && command -v yarn &>/dev/null; then
+                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" yarn audit --json 2>/dev/null)
+                AUDITOR="yarn"
+            elif [ -f "$proj/bun.lockb" ] && command -v bun &>/dev/null; then
+                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" bun pm audit --json 2>/dev/null)
+                AUDITOR="bun"
+            else
+                AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" npm audit --json 2>/dev/null)
+                AUDITOR="npm"
+            fi
+
             if [ $? -eq 124 ]; then
-                info "$proj_name — npm audit timed out"
+                info "$proj_name — $AUDITOR audit timed out"
                 continue
             fi
             VULN_COUNT=$(echo "$AUDIT" | python3 -c "
@@ -230,13 +404,13 @@ try:
     print(d.get('metadata',{}).get('vulnerabilities',{}).get('total',0))
 except: print('?')" 2>/dev/null)
             if [ "$TOTAL" = "0" ]; then
-                pass "$proj_name — 0 vulnerabilities"
+                pass "$proj_name [$AUDITOR] — 0 vulnerabilities"
             elif [ "$VULN_COUNT" != "0" ] && [ "$VULN_COUNT" != "?" ]; then
-                warn "$proj_name — $VULN_COUNT high/critical vulns ($TOTAL total)"
+                warn "$proj_name [$AUDITOR] — $VULN_COUNT high/critical vulns ($TOTAL total)"
             elif [ "$TOTAL" != "?" ]; then
-                info "$proj_name — $TOTAL vulnerabilities (none high/critical)"
+                info "$proj_name [$AUDITOR] — $TOTAL vulnerabilities (none high/critical)"
             else
-                info "$proj_name — npm audit parse error, run manually"
+                info "$proj_name [$AUDITOR] — audit parse error, run manually"
             fi
         done
     fi
@@ -245,7 +419,7 @@ except: print('?')" 2>/dev/null)
     GLOBAL_PKGS=$(npm list -g --depth=0 2>/dev/null | grep -c "@" || echo 0)
     info "$GLOBAL_PKGS global npm packages — run 'npm list -g --depth=0' to review"
 else
-    info "npm not found — skipping Node.js checks"
+    info "npm/pnpm not found — skipping Node.js checks"
 fi
 
 # ─────────────────────────────────────────────
@@ -325,14 +499,25 @@ fi
 header "9. Docker — Suspicious Images"
 # ─────────────────────────────────────────────
 if command -v docker &>/dev/null; then
-    TRIVY_BAD=("aquasec/trivy:0.69.4" "aquasec/trivy:0.69.5" "aquasec/trivy:0.69.6")
     IMAGES=$(docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null)
-    for bad_img in "${TRIVY_BAD[@]}"; do
-        echo "$IMAGES" | grep -q "^$bad_img$" && warn "COMPROMISED Docker image: $bad_img"
-    done
+    DOCKER_HIT=false
+    if [ -f "$PACKAGES_CONF" ]; then
+        while IFS='|' read -r ecosystem pkg bad_versions notes; do
+            [[ -z "$ecosystem" || "$ecosystem" == \#* || "$ecosystem" != "docker" ]] && continue
+            pkg="${pkg// /}"; bad_versions="${bad_versions// /}"
+            IFS=',' read -ra BADS <<< "$bad_versions"
+            for bv in "${BADS[@]}"; do
+                bv="${bv// /}"
+                if echo "$IMAGES" | grep -q "^${pkg}:${bv}$"; then
+                    warn "COMPROMISED Docker image: ${pkg}:${bv} — ${notes}"
+                    DOCKER_HIT=true
+                fi
+            done
+        done < "$PACKAGES_CONF"
+    fi
+    $DOCKER_HIT || pass "No known compromised Docker images found"
     CONTAINER_COUNT=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
     info "$CONTAINER_COUNT running container(s)"
-    pass "Docker image check complete"
 else
     pass "Docker not installed — skip"
 fi
@@ -341,16 +526,24 @@ fi
 header "10. GitHub Actions — Pinning Check (Recursive)"
 # ─────────────────────────────────────────────
 UNPINNED=0
+GHA_SUSPICIOUS=0
 while IFS= read -r -d '' wf; do
+    wf_name="${wf#$SCAN_ROOT/}"
     UNPINNED_LINES=$(grep -nE "uses:\s+[^@]+@v[0-9]" "$wf" 2>/dev/null)
     if [ -n "$UNPINNED_LINES" ]; then
-        wf_name="${wf#$SCAN_ROOT/}"
         warn "Unpinned GitHub Action in $wf_name:"
         echo "$UNPINNED_LINES" | head -3 | sed 's/^/    /'
         UNPINNED=$((UNPINNED+1))
     fi
+    SUSPICIOUS_RUN=$(grep -nE "(curl|wget).*(http|\-).*\|.*(sh|bash|python)|base64.*decode|eval.*curl" "$wf" 2>/dev/null)
+    if [ -n "$SUSPICIOUS_RUN" ]; then
+        warn "Suspicious run: step in GitHub Action $wf_name:"
+        echo "$SUSPICIOUS_RUN" | head -3 | sed 's/^/    /'
+        GHA_SUSPICIOUS=$((GHA_SUSPICIOUS+1))
+    fi
 done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -path "*/.github/workflows/*.yml" -print0 2>/dev/null)
 [ "$UNPINNED" -eq 0 ] && pass "All GitHub Actions pinned (or none found)"
+[ "$GHA_SUSPICIOUS" -eq 0 ] && pass "No suspicious run: patterns in GitHub Actions"
 
 # ─────────────────────────────────────────────
 header "11. VS Code / Cursor Extensions Check"
