@@ -1,4 +1,5 @@
 #!/bin/bash
+export PATH="$HOME/.local/bin:$PATH"
 # =============================================================
 # daily_security_check.sh
 # Supply Chain & Credential Security — Daily Check Script
@@ -8,10 +9,10 @@
 # SCAN_ROOT and runs npm audit / pip-audit in each.
 #
 # Usage:  bash daily_security_check.sh [scan_root]
-#         Default scan_root: ~/Code
+#         Default scan_root: ~
 # =============================================================
 
-SCAN_ROOT="${1:-$HOME/Code}"
+SCAN_ROOT="${1:-$HOME}"
 SCAN_DEPTH=10          # how deep to look for projects
 MAX_AUDIT_TIME=60      # seconds per audit before timeout
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -22,6 +23,35 @@ MEMORY_TEMPLATE="$SCRIPT_DIR/MEMORY.template.md"
 if [ ! -f "$MEMORY_FILE" ] && [ -f "$MEMORY_TEMPLATE" ]; then
     cp "$MEMORY_TEMPLATE" "$MEMORY_FILE"
     echo "Created MEMORY.md from template"
+fi
+
+# ─────────────────────────────────────────────
+# Setup check — verify required tools are installed
+# ─────────────────────────────────────────────
+SETUP_OK=true
+if ! command -v pip-audit &>/dev/null; then
+    SETUP_OK=false
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  SETUP: Missing recommended tools                        ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo "  pip-audit not found — Python vulnerability scanning disabled."
+    echo ""
+    echo "  To install:  pip3 install pip-audit"
+    echo "               # or via pipx (recommended):"
+    echo "               pipx install pip-audit"
+    echo ""
+    printf "  Install pip-audit now? [y/N] "
+    read -r REPLY </dev/tty
+    if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
+        if command -v pipx &>/dev/null; then
+            pipx install pip-audit && echo "  pip-audit installed via pipx." && SETUP_OK=true
+        else
+            pip3 install pip-audit && echo "  pip-audit installed." && SETUP_OK=true
+        fi
+    else
+        echo "  Skipping pip-audit install. Python scan will be limited."
+    fi
 fi
 
 RED='\033[0;31m'
@@ -230,13 +260,14 @@ done < <(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" \
     -not -path "*/venv/*" -not -path "*/.venv/*" -print0 2>/dev/null)
 
 # Deduplicate (a project may have both requirements.txt and pyproject.toml)
-declare -A PY_SEEN
+# Uses bash 3.2-compatible approach (no associative arrays)
 PY_UNIQUE=()
 for p in "${PY_PROJECTS[@]}"; do
-    if [ -z "${PY_SEEN[$p]}" ]; then
-        PY_SEEN[$p]=1
-        PY_UNIQUE+=("$p")
-    fi
+    already_seen=false
+    for seen in "${PY_UNIQUE[@]}"; do
+        [ "$seen" = "$p" ] && already_seen=true && break
+    done
+    $already_seen || PY_UNIQUE+=("$p")
 done
 
 if [ ${#PY_UNIQUE[@]} -eq 0 ]; then
