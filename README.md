@@ -120,6 +120,8 @@ If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code), you ca
 
 ### Setup
 
+![Claude Code scheduled task example](claude-schedule-example.png)
+
 In Claude Code, create a scheduled task (via `/schedule` or the `create_scheduled_task` tool):
 
 ```
