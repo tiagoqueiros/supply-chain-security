@@ -1,6 +1,14 @@
 #!/bin/bash
 export PATH="$HOME/.local/bin:$PATH"
 
+if command -v gtimeout &>/dev/null; then
+    TIMEOUT_CMD="gtimeout"
+elif command -v timeout &>/dev/null; then
+    TIMEOUT_CMD="timeout"
+else
+    TIMEOUT_CMD=""
+fi
+
 SCAN_ROOT="${1:-$HOME}"
 SCAN_DEPTH=6
 MAX_AUDIT_TIME=60
@@ -382,19 +390,29 @@ else
 fi
 
 header "7. Node.js Projects — Recursive audit (npm / pnpm / yarn / bun)"
+info "Note: Projects without lockfiles are skipped (already checked for malicious packages in Section 1b)"
 if command -v npm &>/dev/null || command -v pnpm &>/dev/null; then
     NPM_PROJECTS=()
+    SKIPPED_NO_LOCKFILE=0
     while IFS= read -r pj; do
         if [[ "$pj" == *"/package.json" ]]; then
             proj_dir="$(dirname "$pj")"
-            [ -d "$proj_dir/node_modules" ] && NPM_PROJECTS+=("$proj_dir")
+            if [ -d "$proj_dir/node_modules" ]; then
+                if [ -f "$proj_dir/pnpm-lock.yaml" ] || [ -f "$proj_dir/yarn.lock" ] || [ -f "$proj_dir/bun.lockb" ] || [ -f "$proj_dir/package-lock.json" ]; then
+                    NPM_PROJECTS+=("$proj_dir")
+                else
+                    SKIPPED_NO_LOCKFILE=$((SKIPPED_NO_LOCKFILE+1))
+                fi
+            fi
         fi
     done < "$DISCOVERED_PROJECTS_CACHE"
 
     if [ ${#NPM_PROJECTS[@]} -eq 0 ]; then
-        info "No Node.js projects found under $SCAN_ROOT"
+        info "No Node.js projects with lockfiles found under $SCAN_ROOT"
+        [ $SKIPPED_NO_LOCKFILE -gt 0 ] && info "Skipped $SKIPPED_NO_LOCKFILE project(s) without lockfiles (checked in Section 1b)"
     else
-        info "Found ${#NPM_PROJECTS[@]} Node.js project(s) — auditing in parallel..."
+        info "Found ${#NPM_PROJECTS[@]} Node.js project(s) with lockfiles — auditing in parallel..."
+        [ $SKIPPED_NO_LOCKFILE -gt 0 ] && info "Skipped $SKIPPED_NO_LOCKFILE project(s) without lockfiles (checked in Section 1b)"
 
         JOB_COUNT=0
         for proj in "${NPM_PROJECTS[@]}"; do
@@ -414,21 +432,34 @@ if command -v npm &>/dev/null || command -v pnpm &>/dev/null; then
                 done
 
                 if [ -f "$proj/pnpm-lock.yaml" ] && command -v pnpm &>/dev/null; then
-                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" pnpm audit --offline --json 2>/dev/null)
+                    if [ -n "$TIMEOUT_CMD" ]; then
+                        AUDIT=$(cd "$proj" && $TIMEOUT_CMD "$MAX_AUDIT_TIME" pnpm audit --json 2>&1)
+                    else
+                        AUDIT=$(cd "$proj" && pnpm audit --json 2>&1)
+                    fi
                     AUDITOR="pnpm"
                 elif [ -f "$proj/yarn.lock" ] && command -v yarn &>/dev/null; then
-                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" yarn audit --offline --json 2>/dev/null)
+                    if [ -n "$TIMEOUT_CMD" ]; then
+                        AUDIT=$(cd "$proj" && $TIMEOUT_CMD "$MAX_AUDIT_TIME" yarn audit --json 2>&1)
+                    else
+                        AUDIT=$(cd "$proj" && yarn audit --json 2>&1)
+                    fi
                     AUDITOR="yarn"
                 elif [ -f "$proj/bun.lockb" ] && command -v bun &>/dev/null; then
-                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" bun pm audit --json 2>/dev/null)
+                    if [ -n "$TIMEOUT_CMD" ]; then
+                        AUDIT=$(cd "$proj" && $TIMEOUT_CMD "$MAX_AUDIT_TIME" bun pm audit --json 2>&1)
+                    else
+                        AUDIT=$(cd "$proj" && bun pm audit --json 2>&1)
+                    fi
                     AUDITOR="bun"
-                else
-                    AUDIT=$(cd "$proj" && timeout "$MAX_AUDIT_TIME" npm audit --offline --no-update-notifier --json 2>/dev/null)
+                elif [ -f "$proj/package-lock.json" ] && command -v npm &>/dev/null; then
+                    if [ -n "$TIMEOUT_CMD" ]; then
+                        AUDIT=$(cd "$proj" && $TIMEOUT_CMD "$MAX_AUDIT_TIME" npm audit --no-update-notifier --json 2>&1)
+                    else
+                        AUDIT=$(cd "$proj" && npm audit --no-update-notifier --json 2>&1)
+                    fi
                     AUDITOR="npm"
-                fi
-
-                if [ $? -eq 124 ]; then
-                    echo "INFO|$proj_name|$AUDITOR audit timed out" > "$RESULT_FILE"
+                else
                     exit 0
                 fi
 
@@ -443,7 +474,11 @@ except: print('?')" 2>/dev/null)
 import json,sys
 try:
     d=json.load(sys.stdin)
-    print(d.get('metadata',{}).get('vulnerabilities',{}).get('total',0))
+    v=d.get('metadata',{}).get('vulnerabilities',{})
+    total=v.get('total',0)
+    if total==0:
+        total=v.get('info',0)+v.get('low',0)+v.get('moderate',0)+v.get('high',0)+v.get('critical',0)
+    print(total)
 except: print('?')" 2>/dev/null)
 
                 if [ "$TOTAL" = "0" ]; then
